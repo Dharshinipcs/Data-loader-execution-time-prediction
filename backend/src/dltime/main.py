@@ -1,8 +1,13 @@
 from fastapi import FastAPI
 
+from dltime.config.settings import get_settings
+
+
+settings = get_settings()
+
 app = FastAPI(
-    title="Data Loader Execution Time Prediction API",
-    version="0.1.0",
+    title=settings.app_name,
+    version=settings.app_version,
     description="Backend API for predicting DataZap Data Loader execution times.",
 )
 
@@ -12,4 +17,5 @@ def health_check() -> dict[str, str]:
     return {
         "status": "ok",
         "service": "data-loader-execution-time-prediction",
+        "environment": settings.environment,
     }
