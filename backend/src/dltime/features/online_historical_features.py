@@ -1,18 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from math import sqrt
-from pathlib import Path
 
 import pandas as pd
 
-from dltime.data.feedback_store import ExecutionFeedback, SQLiteFeedbackStore
-
-
-class OnlineHistoricalFeatureError(Exception):
-    """Raised when online historical feature construction fails."""
-
+from dltime.data.feedback_store import (
+    ExecutionFeedback,
+    SQLiteFeedbackStore,
+)
 
 HISTORICAL_FEATURE_COLUMNS: tuple[str, ...] = (
     "global_prior_execution_count",
@@ -24,342 +19,326 @@ HISTORICAL_FEATURE_COLUMNS: tuple[str, ...] = (
     "loader_prior_median_duration_sec",
     "loader_prior_std_duration_sec",
     "loader_previous_duration_sec",
-    "seconds_since_loader_previous_execution",
+    "seconds_since_loader_previous",
 )
 
 
 @dataclass(frozen=True)
 class OnlineHistoricalFeatures:
-    """
-    Causal historical features available immediately before execution.
-
-    All values are derived exclusively from previously persisted,
-    training-eligible successful executions.
-    """
-
     global_prior_execution_count: int
     global_prior_mean_duration_sec: float | None
     global_prior_median_duration_sec: float | None
     global_prior_std_duration_sec: float | None
-
     loader_prior_execution_count: int
     loader_prior_mean_duration_sec: float | None
     loader_prior_median_duration_sec: float | None
     loader_prior_std_duration_sec: float | None
-
     loader_previous_duration_sec: float | None
-    seconds_since_loader_previous_execution: float | None
+    seconds_since_loader_previous: float | None
 
-    def as_dict(self) -> dict[str, int | float | None]:
-        """Return features in the canonical historical-feature schema."""
-
+    def as_dict(
+        self,
+    ) -> dict[str, float | int | None]:
+        """Return historical features using canonical feature names."""
         return {
-            "global_prior_execution_count": (
-                self.global_prior_execution_count
-            ),
-            "global_prior_mean_duration_sec": (
-                self.global_prior_mean_duration_sec
-            ),
-            "global_prior_median_duration_sec": (
-                self.global_prior_median_duration_sec
-            ),
-            "global_prior_std_duration_sec": (
-                self.global_prior_std_duration_sec
-            ),
-            "loader_prior_execution_count": (
-                self.loader_prior_execution_count
-            ),
-            "loader_prior_mean_duration_sec": (
-                self.loader_prior_mean_duration_sec
-            ),
-            "loader_prior_median_duration_sec": (
-                self.loader_prior_median_duration_sec
-            ),
-            "loader_prior_std_duration_sec": (
-                self.loader_prior_std_duration_sec
-            ),
-            "loader_previous_duration_sec": (
-                self.loader_previous_duration_sec
-            ),
-            "seconds_since_loader_previous_execution": (
-                self.seconds_since_loader_previous_execution
-            ),
+            column: getattr(self, column)
+            for column in HISTORICAL_FEATURE_COLUMNS
         }
 
 
-def _normalise_loader_name(loader_name: object) -> str | None:
-    """Normalize loader identity without creating synthetic identities."""
-
-    if loader_name is None:
-        return None
-
-    if pd.isna(loader_name):
-        return None
-
-    normalized = str(loader_name).strip()
-
-    return normalized or None
+class OnlineHistoricalFeatureError(Exception):
+    """Raised when online historical features cannot be built safely."""
 
 
-def _parse_prediction_timestamp(
-    value: str | None,
-) -> datetime | None:
-    """Parse a persisted prediction timestamp."""
+def _normalise_loader_name(
+    value: object,
+) -> str | None:
+    """
+    Normalize loader identity consistently with offline historical features.
 
+    Missing or blank values remain None.
+    Non-missing values are stripped, internal whitespace is collapsed,
+    and the result is upper-cased.
+    """
     if value is None:
         return None
 
-    try:
-        timestamp = pd.Timestamp(value)
-
-    except (TypeError, ValueError):
+    if pd.isna(value):
         return None
 
-    if pd.isna(timestamp):
+    normalized = " ".join(
+        str(value).strip().split()
+    )
+
+    if not normalized:
         return None
 
-    return timestamp.to_pydatetime()
+    return normalized.upper()
 
 
-def _safe_mean(values: list[float]) -> float | None:
-    """Return the arithmetic mean or None when history is empty."""
-
+def _safe_mean(
+    values: list[float],
+) -> float | None:
     if not values:
         return None
 
-    return float(sum(values) / len(values))
+    return float(
+        sum(values) / len(values)
+    )
 
 
-def _safe_median(values: list[float]) -> float | None:
-    """Return the median or None when history is empty."""
-
+def _safe_median(
+    values: list[float],
+) -> float | None:
     if not values:
         return None
 
-    return float(pd.Series(values).median())
+    return float(
+        pd.Series(
+            values,
+            dtype="float64",
+        ).median()
+    )
 
 
-def _safe_std(values: list[float]) -> float | None:
-    """
-    Return population-independent sample standard deviation.
-
-    The offline historical feature implementation uses ddof=1, so the
-    online implementation must use the same convention for consistency.
-    """
-
+def _safe_std(
+    values: list[float],
+) -> float | None:
     if len(values) < 2:
         return None
 
-    mean = sum(values) / len(values)
-
-    squared_deviations = [
-        (value - mean) ** 2
-        for value in values
-    ]
-
     return float(
-        sqrt(
-            sum(squared_deviations)
-            / (len(values) - 1)
+        pd.Series(
+            values,
+            dtype="float64",
+        ).std(
+            ddof=1,
         )
     )
 
 
+def _parse_prediction_timestamp(
+    value: object,
+) -> pd.Timestamp:
+    timestamp = pd.to_datetime(
+        value,
+        errors="coerce",
+    )
+
+    if pd.isna(timestamp):
+        raise OnlineHistoricalFeatureError(
+            f"Invalid prediction timestamp: {value!r}"
+        )
+
+    return timestamp
+
+
 class OnlineHistoricalFeatureProvider:
     """
-    Build causal historical features from persisted feedback.
+    Build leakage-safe historical features from persisted feedback.
 
-    The provider is deliberately read-only with respect to feedback.
-    It never writes the current execution into history.
+    Only training-eligible successful executions with positive actual
+    durations are considered.
 
-    A caller should:
-        1. create prediction_timestamp at execution-trigger time;
-        2. request features using that timestamp;
-        3. generate the prediction;
-        4. execute the loader;
-        5. persist post-execution feedback separately.
-
-    Only records satisfying the feedback store's training-eligibility
-    policy are allowed to contribute to historical duration features.
+    A feedback record is usable only when its prediction timestamp is
+    strictly earlier than the current prediction timestamp.
     """
 
     def __init__(
         self,
         store: SQLiteFeedbackStore,
     ) -> None:
-        if not isinstance(store, SQLiteFeedbackStore):
-            raise TypeError(
-                "store must be a SQLiteFeedbackStore instance."
-            )
-
         self.store = store
 
-    @staticmethod
     def _eligible_records(
-        records: list[ExecutionFeedback],
-    ) -> list[
-        tuple[
-            ExecutionFeedback,
-            datetime,
-        ]
-    ]:
-        """
-        Return valid training records with parseable prediction timestamps.
+        self,
+        prediction_timestamp: pd.Timestamp,
+    ) -> list[ExecutionFeedback]:
+        records = self.store.all_records()
 
-        Records are sorted by execution/prediction timestamp, not by
-        recorded_at, because causal ordering depends on when prediction
-        was generated.
-        """
-
-        eligible: list[
-            tuple[
-                ExecutionFeedback,
-                datetime,
-            ]
-        ] = []
+        eligible: list[ExecutionFeedback] = []
 
         for record in records:
             if not record.training_eligible:
                 continue
 
-            if record.execution_status != "SUCCEED":
-                continue
-
             if (
-                record.actual_total_seconds is None
-                or record.actual_total_seconds <= 0
+                record.execution_status is None
+                or record.execution_status.upper() != "SUCCEED"
             ):
                 continue
 
-            timestamp = _parse_prediction_timestamp(
-                record.prediction_timestamp
-            )
-
-            if timestamp is None:
+            if record.actual_total_seconds is None:
                 continue
 
-            eligible.append(
-                (
-                    record,
-                    timestamp,
+            if record.actual_total_seconds <= 0:
+                continue
+
+            if record.prediction_timestamp is None:
+                continue
+
+            try:
+                record_timestamp = (
+                    _parse_prediction_timestamp(
+                        record.prediction_timestamp
+                    )
                 )
-            )
+            except OnlineHistoricalFeatureError:
+                continue
+
+            # Strictly earlier only: prevents same-time leakage.
+            if record_timestamp >= prediction_timestamp:
+                continue
+
+            eligible.append(record)
 
         eligible.sort(
-            key=lambda item: (
-                item[1],
-                item[0].execution_id,
+            key=lambda record: (
+                _parse_prediction_timestamp(
+                    record.prediction_timestamp
+                ),
+                str(record.execution_id),
             )
         )
 
         return eligible
 
-    def build(
+    def get_features(
         self,
         *,
-        loader_name: str | None,
-        prediction_timestamp: str | datetime,
+        loader_name: object,
+        prediction_timestamp: object,
     ) -> OnlineHistoricalFeatures:
         """
-        Build causal features for one prediction request.
-
-        Only persisted eligible executions with timestamps strictly
-        earlier than prediction_timestamp contribute to history.
-
-        Executions sharing the exact prediction timestamp are therefore
-        treated as concurrent and cannot influence one another.
+        Build leakage-safe historical features for one prediction request.
         """
-
-        if isinstance(prediction_timestamp, datetime):
-            current_timestamp = prediction_timestamp
-
-        else:
-            try:
-                current_timestamp = pd.Timestamp(
-                    prediction_timestamp
-                ).to_pydatetime()
-
-            except (TypeError, ValueError) as exc:
-                raise OnlineHistoricalFeatureError(
-                    "prediction_timestamp must be a valid datetime "
-                    "or ISO timestamp string."
-                ) from exc
-
-        if pd.isna(current_timestamp):
-            raise OnlineHistoricalFeatureError(
-                "prediction_timestamp must not be missing."
-            )
-
-        loader_key = _normalise_loader_name(loader_name)
-
-        records = self._eligible_records(
-            self.store.all_records()
+        return self.build(
+            loader_name=loader_name,
+            prediction_timestamp=prediction_timestamp,
         )
 
-        global_history: list[float] = []
-        loader_history: list[float] = []
-        previous_loader_timestamp: datetime | None = None
+    def build(
+        self,
+        loader_name: object,
+        prediction_timestamp: object,
+    ) -> OnlineHistoricalFeatures:
+        current_timestamp = (
+            _parse_prediction_timestamp(
+                prediction_timestamp
+            )
+        )
 
-        for record, record_timestamp in records:
-            if record_timestamp >= current_timestamp:
-                break
+        normalized_loader = (
+            _normalise_loader_name(
+                loader_name
+            )
+        )
 
-            duration = float(record.actual_total_seconds)
+        records = self._eligible_records(
+            current_timestamp
+        )
 
-            global_history.append(duration)
+        global_durations: list[float] = []
+        loader_durations: list[float] = []
 
-            record_loader = _normalise_loader_name(
-                record.loader_name
+        loader_previous_timestamp: (
+            pd.Timestamp | None
+        ) = None
+
+        loader_previous_duration: (
+            float | None
+        ) = None
+
+        for record in records:
+            duration = float(
+                record.actual_total_seconds
+            )
+
+            record_loader = (
+                _normalise_loader_name(
+                    record.loader_name
+                )
+            )
+
+            global_durations.append(
+                duration
             )
 
             if (
-                loader_key is not None
-                and record_loader == loader_key
+                normalized_loader is not None
+                and record_loader == normalized_loader
             ):
-                loader_history.append(duration)
-                previous_loader_timestamp = record_timestamp
+                loader_durations.append(
+                    duration
+                )
 
-        global_mean = _safe_mean(global_history)
-        global_median = _safe_median(global_history)
-        global_std = _safe_std(global_history)
+                record_timestamp = (
+                    _parse_prediction_timestamp(
+                        record.prediction_timestamp
+                    )
+                )
 
-        loader_mean = _safe_mean(loader_history)
-        loader_median = _safe_median(loader_history)
-        loader_std = _safe_std(loader_history)
+                loader_previous_timestamp = (
+                    record_timestamp
+                )
 
-        if loader_history:
-            previous_duration = float(
-                loader_history[-1]
-            )
-        else:
-            previous_duration = None
+                loader_previous_duration = (
+                    duration
+                )
 
-        if previous_loader_timestamp is None:
-            seconds_since_previous = None
+        seconds_since_previous: (
+            float | None
+        ) = None
 
-        else:
+        if loader_previous_timestamp is not None:
             seconds_since_previous = float(
                 (
                     current_timestamp
-                    - previous_loader_timestamp
+                    - loader_previous_timestamp
                 ).total_seconds()
             )
 
         return OnlineHistoricalFeatures(
-            global_prior_execution_count=len(
-                global_history
+            global_prior_execution_count=(
+                len(global_durations)
             ),
-            global_prior_mean_duration_sec=global_mean,
-            global_prior_median_duration_sec=global_median,
-            global_prior_std_duration_sec=global_std,
-            loader_prior_execution_count=len(
-                loader_history
+            global_prior_mean_duration_sec=(
+                _safe_mean(
+                    global_durations
+                )
             ),
-            loader_prior_mean_duration_sec=loader_mean,
-            loader_prior_median_duration_sec=loader_median,
-            loader_prior_std_duration_sec=loader_std,
-            loader_previous_duration_sec=previous_duration,
-            seconds_since_loader_previous_execution=(
+            global_prior_median_duration_sec=(
+                _safe_median(
+                    global_durations
+                )
+            ),
+            global_prior_std_duration_sec=(
+                _safe_std(
+                    global_durations
+                )
+            ),
+            loader_prior_execution_count=(
+                len(loader_durations)
+            ),
+            loader_prior_mean_duration_sec=(
+                _safe_mean(
+                    loader_durations
+                )
+            ),
+            loader_prior_median_duration_sec=(
+                _safe_median(
+                    loader_durations
+                )
+            ),
+            loader_prior_std_duration_sec=(
+                _safe_std(
+                    loader_durations
+                )
+            ),
+            loader_previous_duration_sec=(
+                loader_previous_duration
+            ),
+            seconds_since_loader_previous=(
                 seconds_since_previous
             ),
         )

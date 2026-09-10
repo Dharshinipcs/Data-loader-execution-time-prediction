@@ -1,0 +1,226 @@
+.trend-chart {
+  width: 100%;
+  min-height: 330px;
+  padding: 18px 20px 14px 10px;
+}
+
+.trend-chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 0 12px 52px;
+}
+
+.trend-chart-legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.trend-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #687386;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.trend-legend-line {
+  display: inline-block;
+  width: 20px;
+  height: 2px;
+  border-radius: 999px;
+}
+
+.trend-legend-average {
+  background: #526176;
+}
+
+.trend-legend-median {
+  background: #98a1ae;
+}
+
+.trend-chart-context {
+  color: #a0a8b4;
+  font-size: 8px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.trend-chart-body {
+  display: flex;
+  width: 100%;
+}
+
+.trend-chart-y-axis {
+  width: 52px;
+  min-width: 52px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 2px 8px 34px 0;
+  color: #929cab;
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    monospace;
+  font-size: 8px;
+  text-align: right;
+}
+
+.trend-chart-area {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 270px;
+  padding-bottom: 30px;
+}
+
+.trend-grid-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px dashed #e8ebef;
+  pointer-events: none;
+}
+
+.trend-grid-top {
+  top: 10px;
+}
+
+.trend-grid-middle {
+  top: 50%;
+}
+
+.trend-grid-bottom {
+  bottom: 30px;
+}
+
+.trend-svg {
+  position: absolute;
+  inset: 0 0 30px;
+  width: 100%;
+  height: calc(100% - 30px);
+  overflow: visible;
+}
+
+.trend-line {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.trend-line-average {
+  stroke: #526176;
+}
+
+.trend-line-median {
+  stroke: #aab2bd;
+  stroke-dasharray: 5 4;
+}
+
+.trend-point {
+  stroke: #ffffff;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.trend-point-average {
+  fill: #526176;
+}
+
+.trend-point-median {
+  fill: #aab2bd;
+}
+
+.trend-labels {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 25px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 6px;
+  color: #98a1ae;
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    monospace;
+  font-size: 7px;
+  white-space: nowrap;
+}
+
+.trend-label-hidden {
+  visibility: hidden;
+}
+
+.chart-empty {
+  min-height: 300px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: #8d97a5;
+  text-align: center;
+}
+
+.chart-empty strong {
+  color: #586476;
+  font-size: 11px;
+}
+
+.chart-empty span {
+  font-size: 9px;
+}
+
+@media (max-width: 600px) {
+  .trend-chart {
+    min-height: 280px;
+    padding-right: 8px;
+  }
+
+  .trend-chart-header {
+    margin-left: 43px;
+    gap: 8px;
+  }
+
+  .trend-chart-legend {
+    gap: 10px;
+  }
+
+  .trend-legend-item {
+    font-size: 8px;
+  }
+
+  .trend-chart-context {
+    font-size: 7px;
+  }
+
+  .trend-chart-area {
+    height: 225px;
+  }
+
+  .trend-chart-y-axis {
+    width: 43px;
+    min-width: 43px;
+    font-size: 7px;
+  }
+
+  .trend-labels {
+    font-size: 6px;
+  }
+}
+

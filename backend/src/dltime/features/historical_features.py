@@ -5,27 +5,16 @@ from pathlib import Path
 import pandas as pd
 
 
-class HistoricalFeatureError(Exception):
-    """Raised when historical feature construction fails."""
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-
 TRAINING_TARGETS_PATH = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "execution_training_targets.csv"
+    PROJECT_ROOT / "data" / "processed" / "execution_training_targets.csv"
 )
-
 OUTPUT_PATH = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "execution_historical_features.csv"
+    PROJECT_ROOT / "data" / "processed" / "execution_historical_features.csv"
 )
 
-REQUIRED_COLUMNS: tuple[str, ...] = (
+
+REQUIRED_COLUMNS = (
     "LDR_Execution_Id",
     "Loader_Name",
     "Start_Time",
@@ -33,7 +22,12 @@ REQUIRED_COLUMNS: tuple[str, ...] = (
 )
 
 
-HISTORICAL_FEATURE_COLUMNS: tuple[str, ...] = (
+OUTPUT_COLUMNS = (
+    "LDR_Execution_Id",
+    "Loader_Name",
+    "Sprint",
+    "Start_Time",
+    "timetaken_in_sec",
     "global_prior_execution_count",
     "global_prior_mean_duration_sec",
     "global_prior_median_duration_sec",
@@ -43,320 +37,273 @@ HISTORICAL_FEATURE_COLUMNS: tuple[str, ...] = (
     "loader_prior_median_duration_sec",
     "loader_prior_std_duration_sec",
     "loader_previous_duration_sec",
-    "seconds_since_loader_previous_execution",
+    "seconds_since_loader_previous",
 )
 
 
-def _validate_input(dataframe: pd.DataFrame) -> None:
-    """Validate the minimum columns required for historical features."""
+class HistoricalFeatureError(Exception):
+    """Raised when historical feature generation cannot be completed safely."""
 
-    missing_columns = [
-        column
-        for column in REQUIRED_COLUMNS
+
+def _normalise_loader_name(value: object) -> str | None:
+    """
+    Normalize loader identity consistently with the canonical project identity.
+
+    Missing or blank values remain None.
+    Non-missing values are stripped, internal whitespace is collapsed,
+    and the result is upper-cased.
+    """
+    if value is None:
+        return None
+
+    if pd.isna(value):
+        return None
+
+    normalized = " ".join(str(value).strip().split())
+
+    if not normalized:
+        return None
+
+    return normalized.upper()
+
+
+def _safe_mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _safe_median(values: list[float]) -> float | None:
+    if not values:
+        return None
+
+    series = pd.Series(values, dtype="float64")
+    return float(series.median())
+
+
+def _safe_std(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+
+    series = pd.Series(values, dtype="float64")
+    return float(series.std(ddof=1))
+
+
+def _validate_input(dataframe: pd.DataFrame) -> None:
+    missing = [
+        column for column in REQUIRED_COLUMNS
         if column not in dataframe.columns
     ]
 
-    if missing_columns:
+    if missing:
         raise HistoricalFeatureError(
-            "Missing columns required for historical feature construction: "
-            + ", ".join(missing_columns)
+            "Missing required columns: " + ", ".join(missing)
         )
 
     if dataframe.empty:
         raise HistoricalFeatureError(
-            "Cannot construct historical features from an empty dataset."
+            "Training target dataset is empty."
         )
 
     if dataframe["LDR_Execution_Id"].duplicated().any():
         duplicate_count = int(
             dataframe["LDR_Execution_Id"].duplicated().sum()
         )
-
         raise HistoricalFeatureError(
-            "Historical feature construction requires one row per execution. "
-            f"Found {duplicate_count} duplicate execution rows."
+            f"Expected one row per execution, found {duplicate_count} "
+            "duplicate execution rows."
         )
 
 
-def _safe_mean(values: list[float]) -> float | None:
-    """Return the arithmetic mean or None when no history exists."""
+def _prepare_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    prepared = dataframe.copy()
 
-    if not values:
-        return None
+    prepared["Loader_Name"] = prepared["Loader_Name"].map(
+        _normalise_loader_name
+    )
 
-    return float(sum(values) / len(values))
-
-
-def _safe_median(values: list[float]) -> float | None:
-    """Return the median or None when no history exists."""
-
-    if not values:
-        return None
-
-    return float(pd.Series(values).median())
-
-
-def _safe_std(values: list[float]) -> float | None:
-    """
-    Return sample standard deviation.
-
-    Standard deviation is undefined for fewer than two observations, so
-    None is returned until sufficient history exists.
-    """
-
-    if len(values) < 2:
-        return None
-
-    return float(pd.Series(values).std(ddof=1))
-
-
-def _normalise_loader_name(loader_name: object) -> str | None:
-    """
-    Normalize loader identity for historical grouping.
-
-    Missing or blank loader names are treated as unavailable rather than
-    being converted into an artificial loader identity.
-    """
-
-    if pd.isna(loader_name):
-        return None
-
-    normalized = str(loader_name).strip()
-
-    if not normalized:
-        return None
-
-    return normalized
-
-
-def build_historical_features(
-    dataframe: pd.DataFrame,
-    output_path: Path | None = OUTPUT_PATH,
-) -> pd.DataFrame:
-    """
-    Build leakage-safe historical execution features.
-
-    Historical information is strictly causal:
-
-    * Only executions with Start_Time strictly earlier than the current
-      execution can contribute historical information.
-    * Executions sharing the exact same Start_Time are treated as concurrent.
-    * Concurrent executions cannot contribute their targets to one another.
-    * Loader-specific history is calculated only when Loader_Name exists.
-    * Missing loader identities receive global history only.
-    * The current execution's target is added to history only after its
-      features have been calculated.
-    """
-
-    if not isinstance(dataframe, pd.DataFrame):
-        raise TypeError("dataframe must be a pandas DataFrame.")
-
-    _validate_input(dataframe)
-
-    result = dataframe.copy()
-
-    result["Start_Time"] = pd.to_datetime(
-        result["Start_Time"],
+    prepared["Start_Time"] = pd.to_datetime(
+        prepared["Start_Time"],
         errors="coerce",
     )
 
-    result["timetaken_in_sec"] = pd.to_numeric(
-        result["timetaken_in_sec"],
+    if prepared["Start_Time"].isna().any():
+        invalid_count = int(prepared["Start_Time"].isna().sum())
+        raise HistoricalFeatureError(
+            f"Found {invalid_count} rows with invalid Start_Time."
+        )
+
+    prepared["timetaken_in_sec"] = pd.to_numeric(
+        prepared["timetaken_in_sec"],
         errors="coerce",
     )
 
-    invalid_start_time = result["Start_Time"].isna()
-
-    if invalid_start_time.any():
+    if prepared["timetaken_in_sec"].isna().any():
+        invalid_count = int(prepared["timetaken_in_sec"].isna().sum())
         raise HistoricalFeatureError(
-            "Historical feature construction requires a valid Start_Time "
-            f"for every execution. Found {int(invalid_start_time.sum())} "
-            "invalid timestamps."
+            f"Found {invalid_count} rows with invalid target duration."
         )
 
-    invalid_target = (
-        result["timetaken_in_sec"].isna()
-        | (result["timetaken_in_sec"] <= 0)
-    )
-
-    if invalid_target.any():
+    if (prepared["timetaken_in_sec"] <= 0).any():
+        invalid_count = int(
+            (prepared["timetaken_in_sec"] <= 0).sum()
+        )
         raise HistoricalFeatureError(
-            "Historical feature construction requires a positive target "
-            f"duration for every execution. Found {int(invalid_target.sum())} "
-            "invalid targets."
+            f"Found {invalid_count} rows with non-positive target duration."
         )
 
-    result = result.sort_values(
+    prepared = prepared.sort_values(
         ["Start_Time", "LDR_Execution_Id"],
         kind="mergesort",
     ).reset_index(drop=True)
 
+    return prepared
+
+
+def _build_historical_features(dataframe: pd.DataFrame) -> pd.DataFrame:
     global_history: list[float] = []
     loader_history: dict[str, list[float]] = {}
-    loader_last_start: dict[str, pd.Timestamp] = {}
+    loader_previous: dict[str, tuple[pd.Timestamp, float]] = {}
 
-    feature_records: list[dict[str, object]] = []
+    output_rows: list[dict[str, object]] = []
 
-    # Process one timestamp group at a time.
-    #
-    # This is important for strict temporal leakage prevention. Every
-    # execution in the group must see the same history state: only
-    # executions whose Start_Time is strictly earlier than this timestamp.
-    for start_time, timestamp_group in result.groupby(
-        "Start_Time",
-        sort=True,
-    ):
-        pending_updates: list[tuple[str | None, float, pd.Timestamp]] = []
+    index = 0
 
-        # ---------------------------------------------------------------
-        # Phase 1: calculate features for every execution at this timestamp
-        # without updating historical state.
-        # ---------------------------------------------------------------
-        for row in timestamp_group.itertuples(index=False):
-            execution_id = getattr(row, "LDR_Execution_Id")
-            loader_name = getattr(row, "Loader_Name")
-            target_duration = float(getattr(row, "timetaken_in_sec"))
+    while index < len(dataframe):
+        timestamp = dataframe.iloc[index]["Start_Time"]
 
-            loader_key = _normalise_loader_name(loader_name)
+        same_time_indices: list[int] = []
 
-            if global_history:
-                global_mean = _safe_mean(global_history)
-                global_median = _safe_median(global_history)
-                global_std = _safe_std(global_history)
+        while (
+            index + len(same_time_indices) < len(dataframe)
+            and dataframe.iloc[index + len(same_time_indices)]["Start_Time"]
+            == timestamp
+        ):
+            same_time_indices.append(index + len(same_time_indices))
+
+        # Phase 1:
+        # Calculate historical features for every execution at this timestamp
+        # BEFORE adding any same-timestamp execution to history.
+        pending_history_updates: list[tuple[int, str | None, float]] = []
+
+        for row_index in same_time_indices:
+            row = dataframe.iloc[row_index]
+
+            loader_name = row["Loader_Name"]
+            duration = float(row["timetaken_in_sec"])
+
+            global_values = list(global_history)
+
+            if loader_name is None:
+                loader_values: list[float] = []
+                previous_record = None
             else:
-                global_mean = None
-                global_median = None
-                global_std = None
-
-            if loader_key is None:
-                current_loader_history: list[float] = []
-                previous_loader_start = None
-            else:
-                current_loader_history = loader_history.get(
-                    loader_key,
-                    [],
+                loader_values = list(
+                    loader_history.get(loader_name, [])
                 )
+                previous_record = loader_previous.get(loader_name)
 
-                previous_loader_start = loader_last_start.get(
-                    loader_key,
-                )
-
-            if current_loader_history:
-                loader_mean = _safe_mean(current_loader_history)
-                loader_median = _safe_median(current_loader_history)
-                loader_std = _safe_std(current_loader_history)
-                previous_duration = float(current_loader_history[-1])
-            else:
-                loader_mean = None
-                loader_median = None
-                loader_std = None
-                previous_duration = None
-
-            if previous_loader_start is None:
-                seconds_since_previous = None
-            else:
-                seconds_since_previous = float(
-                    (
-                        start_time
-                        - previous_loader_start
-                    ).total_seconds()
-                )
-
-            feature_records.append(
+            output_rows.append(
                 {
-                    "LDR_Execution_Id": execution_id,
-                    "global_prior_execution_count": len(global_history),
-                    "global_prior_mean_duration_sec": global_mean,
-                    "global_prior_median_duration_sec": global_median,
-                    "global_prior_std_duration_sec": global_std,
-                    "loader_prior_execution_count": len(
-                        current_loader_history
+                    "LDR_Execution_Id": row["LDR_Execution_Id"],
+                    "Loader_Name": loader_name,
+                    "Sprint": row["Sprint"]
+                    if "Sprint" in dataframe.columns
+                    else None,
+                    "Start_Time": timestamp,
+                    "timetaken_in_sec": duration,
+                    "global_prior_execution_count": len(global_values),
+                    "global_prior_mean_duration_sec": _safe_mean(
+                        global_values
                     ),
-                    "loader_prior_mean_duration_sec": loader_mean,
-                    "loader_prior_median_duration_sec": loader_median,
-                    "loader_prior_std_duration_sec": loader_std,
-                    "loader_previous_duration_sec": previous_duration,
-                    "seconds_since_loader_previous_execution": (
-                        seconds_since_previous
+                    "global_prior_median_duration_sec": _safe_median(
+                        global_values
+                    ),
+                    "global_prior_std_duration_sec": _safe_std(
+                        global_values
+                    ),
+                    "loader_prior_execution_count": len(loader_values),
+                    "loader_prior_mean_duration_sec": _safe_mean(
+                        loader_values
+                    ),
+                    "loader_prior_median_duration_sec": _safe_median(
+                        loader_values
+                    ),
+                    "loader_prior_std_duration_sec": _safe_std(
+                        loader_values
+                    ),
+                    "loader_previous_duration_sec": (
+                        previous_record[1]
+                        if previous_record is not None
+                        else None
+                    ),
+                    "seconds_since_loader_previous": (
+                        float(
+                            (
+                                timestamp - previous_record[0]
+                            ).total_seconds()
+                        )
+                        if previous_record is not None
+                        else None
                     ),
                 }
             )
 
-            pending_updates.append(
-                (
-                    loader_key,
-                    target_duration,
-                    start_time,
-                )
+            pending_history_updates.append(
+                (row_index, loader_name, duration)
             )
 
-        # ---------------------------------------------------------------
-        # Phase 2: only after ALL executions at this timestamp have had
-        # their features calculated, update historical state.
-        # ---------------------------------------------------------------
-        for loader_key, target_duration, execution_start in pending_updates:
-            global_history.append(target_duration)
+        # Phase 2:
+        # Only after all same-timestamp features are calculated do these
+        # executions become available to later executions.
+        for _, loader_name, duration in pending_history_updates:
+            global_history.append(duration)
 
-            if loader_key is not None:
-                loader_history.setdefault(
-                    loader_key,
-                    [],
-                ).append(target_duration)
+            if loader_name is not None:
+                loader_history.setdefault(loader_name, []).append(
+                    duration
+                )
+                loader_previous[loader_name] = (
+                    timestamp,
+                    duration,
+                )
 
-                loader_last_start[loader_key] = execution_start
+        index += len(same_time_indices)
 
-    historical_features = pd.DataFrame(feature_records)
+    result = pd.DataFrame(output_rows)
 
-    result = result.merge(
-        historical_features,
-        on="LDR_Execution_Id",
-        how="left",
-        validate="one_to_one",
-    )
-
-    if output_path is not None:
-        output_path = Path(output_path)
-
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        result.to_csv(
-            output_path,
-            index=False,
-        )
-
-    return result
+    return result[list(OUTPUT_COLUMNS)]
 
 
-def build_historical_features_from_file(
-    input_path: Path = TRAINING_TARGETS_PATH,
-    output_path: Path = OUTPUT_PATH,
+def build_historical_features(
+    input_path: str | Path = TRAINING_TARGETS_PATH,
+    output_path: str | Path = OUTPUT_PATH,
 ) -> Path:
-    """
-    Build historical features from the canonical training-target CSV.
-    """
+    input_file = Path(input_path)
+    output_file = Path(output_path)
 
-    input_path = Path(input_path)
-
-    if not input_path.exists():
+    if not input_file.exists():
         raise HistoricalFeatureError(
-            f"Training-target file not found: {input_path}"
+            f"Training target file not found: {input_file}"
         )
 
-    dataframe = pd.read_csv(input_path)
+    dataframe = pd.read_csv(input_file)
 
-    build_historical_features(
-        dataframe,
-        output_path=output_path,
-    )
+    _validate_input(dataframe)
 
-    return Path(output_path)
+    prepared = _prepare_dataframe(dataframe)
+
+    features = _build_historical_features(prepared)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    features.to_csv(output_file, index=False)
+
+    return output_file
 
 
 if __name__ == "__main__":
-    output = build_historical_features_from_file()
+    output = build_historical_features()
 
     print("historical feature build complete")
     print(f"output={output}")
+    print(f"rows={len(pd.read_csv(output))}")

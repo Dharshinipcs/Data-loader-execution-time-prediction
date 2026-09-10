@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import pandas as pd
 
 
@@ -14,6 +12,7 @@ EXECUTION_REPRESENTATIVE_COLUMNS: tuple[str, ...] = (
     "Loader_Name",
     "LDR_Status",
     "Sprint",
+    "ldr_connection_name",
     "ldr_workflow_execution_id",
     "Start_Time",
     "End_Time",
@@ -91,6 +90,9 @@ def reconstruct_executions(
       dataset rows can represent concurrent stage activity.
     * Other stored execution-level timing values use their representative
       non-null value.
+    * Connection resolution status is intentionally not treated as a
+      representative field because different datasets in one execution
+      may use different resolution methods.
     """
     if not isinstance(dataframe, pd.DataFrame):
         raise TypeError("dataframe must be a pandas DataFrame.")
